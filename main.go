@@ -7,6 +7,10 @@ import (
   "log"
   "crypto/elliptic"
   "math/big"
+  "strings"
+  "fmt"
+  "time"
+  "runtime/pprof"
 )
 
 const (
@@ -91,13 +95,63 @@ func curveForCurveID(id TLSCurveID) (elliptic.Curve, bool) {
   }
 }
 
+func getCPUProfileFile() string {
+  return os.Getenv("ECDH_CPUPROFILE")
+}
+
+// Replace instances in formatString of {TIMESTAMP} with when formatted as
+// YYYYMMDDhhmmss, and {NANOS} as the decimal nanosecond offset.
+func getFormattedFile(formatString string, when time.Time) string {
+  timestamp := when.Format("20060102150405")
+  nanos := fmt.Sprintf("%d", when.Nanosecond())
+  ret := strings.Replace(formatString, "{TIMESTAMP}", timestamp, -1)
+  ret = strings.Replace(ret, "{NANOS}", nanos, -1)
+  return ret
+}
+
+// If CPU profiling is enabled (ZGRAB2_CPUPROFILE is not empty), start tracking
+// CPU profiling in the configured file. Caller is responsible for invoking
+// stopCPUProfile() when finished.
+func startCPUProfile() {
+  if file := getCPUProfileFile(); file != "" {
+    now := time.Now()
+    fullFile := getFormattedFile(file, now)
+    f, err := os.Create(fullFile)
+    if err != nil {
+      log.Fatal("could not create CPU profile: ", err)
+    }
+    if err := pprof.StartCPUProfile(f); err != nil {
+      log.Fatal("could not start CPU profile: ", err)
+    }
+  }
+}
+
+// If CPU profiling is enabled (ZGRAB2_CPUPROFILE is not empty), stop profiling
+// CPU usage.
+func stopCPUProfile() {
+  if getCPUProfileFile() != "" {
+    pprof.StopCPUProfile()
+  }
+}
+
 func main() {
+  startCPUProfile()
+  defer stopCPUProfile()
   params := readParams(os.Args[1])
 
+  failures := 0
+
   for _, p := range params {
-    log.Println(p.Server.Curve)
-    log.Println(p.Client.Private)
+    if curve, ok := curveForCurveID(p.Server.Curve.Id); ok {
+      curve.ScalarMult(p.Server.Public.X, p.Server.Public.Y, p.Client.Private.Raw)
+    } else {
+      failures += 1
+      continue
+    }
   }
+
+  log.Println("Failures:")
+  log.Println(failures)
 }
 
 func readParams(filename string) []HandshakeParams {
@@ -118,6 +172,10 @@ func readParams(filename string) []HandshakeParams {
       break
     } else if err != nil{
       log.Fatal(err)
+    }
+
+    if p.Server.Curve.Id == 0 {
+      continue
     }
 
     params = append(params, p)
